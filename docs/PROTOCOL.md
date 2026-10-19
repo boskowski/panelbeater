@@ -547,7 +547,10 @@ panel also lingers on "Scanning…" after the last sheet.
 A host that writes it only every few minutes sees the iX1600 panel report the
 connection lost about 10 s after a batch, for about 30 s.
 
-Untested on an iX1500.
+All of this is applied to the iX1600 only (`04c5:1632`). Other models keep
+the hopper-sensor check before each feed, `31 02` + `05` at the end, and the
+session write on the `rearm` interval, because none of it has been measured on
+them.
 
 The document channel over USB is `SEND DIAGNOSTIC` with a 16-byte
 space-padded name `"SETUP PROF INFO "`, then a 16-byte operation header, then

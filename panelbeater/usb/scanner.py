@@ -56,6 +56,12 @@ FILLER = 0x55  # what the scanner streams once the sheet has passed
 PADDING_CHUNKS = 5  # all-zero reads in a row (~40 rows) that end a side
 STATUS_BYTE = 9  # SCSI status in the 13-byte USB status reply
 CHECK_CONDITION = 0x02
+IX1600_PID = 0x1632  # the batch behaviour below was measured on this model only
+
+
+def is_ix1600(dev) -> bool:
+    """True if `dev` (an Ix1500 transport) is an iX1600. False if it can't tell."""
+    return getattr(getattr(dev, "dev", None), "idProduct", None) == IX1600_PID
 
 # The hand-typed MODE SELECT pages, gamma tables and SET WINDOW descriptor that
 # used to live here have been removed on purpose. Every one of them was
@@ -72,6 +78,7 @@ class UsbScanner:
     def __init__(self, dev, resolution: int = 300, mode: str = "color",
                  duplex: bool = True, verbose: bool = False):  # fmt: skip
         self.dev = dev
+        self.ix1600 = is_ix1600(dev)
         self.verbose = verbose
         self.resolution = resolution
         self.mode = mode
@@ -156,19 +163,29 @@ class UsbScanner:
 
         Returns None on success, or the ASCQ of the fault that stopped it.
 
-        The hopper sensor is NOT asked first. The iX1600 pulls sheets in ahead
-        of the host: in a 7-sheet batch it read empty after sheet 2, and pages
-        3 to 7 were still in the scanner. The end of the batch is OBJECT
-        POSITION itself failing with hopper empty (key 3 / ASC 0x80 / ASCQ
-        0x03), as in ScanSnap Home's capture of the same batch.
+        Other models check the hopper BEFORE feeding: afterwards "hopper
+        empty" just means that was the last sheet, and treating it as failure
+        breaks single-sheet loads.
+
+        An iX1600 is NOT asked. It pulls sheets in ahead of the host: in a
+        7-sheet batch it read empty after sheet 2, and pages 3 to 7 were still
+        in the scanner. The end of the batch is OBJECT POSITION itself failing
+        with hopper empty (key 3 / ASC 0x80 / ASCQ 0x03), as in ScanSnap
+        Home's capture of the same batch.
 
         Nothing else is sent between the feed and SCAN -- the gap in the
         capture is OBJECT POSITION blocking while the sheet feeds, and slipping
-        a REQUEST SENSE in there earns a command-sequence error. Sense is read
-        only when the feed reports CHECK CONDITION, and then SCAN is not sent.
+        a REQUEST SENSE in there earns a command-sequence error. On an iX1600
+        sense is read only when the feed reports CHECK CONDITION, and then
+        SCAN is not sent.
         """
+        if not self.ix1600:
+            g, _ = self.dev.hw_status(0x30)
+            if len(g) > 3 and (g[3] & 0x80):
+                self.last_fault = 0x03
+                return 0x03
         _, status = self._cmd([0x31, 0x01, 0, 0, 0, 0, 0, 0, 0, 0])  # OBJECT POSITION feed
-        if len(status) > STATUS_BYTE and status[STATUS_BYTE] == CHECK_CONDITION:
+        if self.ix1600 and len(status) > STATUS_BYTE and status[STATUS_BYTE] == CHECK_CONDITION:
             key, asc, ascq, _, _ = self.sense()
             self.last_fault = ascq if key == 0x03 and asc == 0x80 else 0xFF
             return self.last_fault
@@ -241,11 +258,11 @@ class UsbScanner:
                     # The iX1600 pads with 0x00 (white) instead, and never
                     # sends EOM. One white chunk can be the bright line at the
                     # leading edge, so it takes a run of them.
-                    if len(data) > 4096 and data.count(0) >= len(data) * 0.99:
+                    if self.ix1600 and len(data) > 4096 and data.count(0) >= len(data) * 0.99:
                         padding[w] += 1
                         if padding[w] >= PADDING_CHUNKS:
                             done[w] = True
-                    else:
+                    elif self.ix1600:
                         padding[w] = 0
                 if eom or not data:
                     done[w] = True
@@ -255,7 +272,7 @@ class UsbScanner:
                     print(f"    window {w:#04x}: hit the {cap:,}B ceiling, stopping",
                           flush=True)  # fmt: skip
                     done[w] = True
-        for w in windows:
+        for w in windows if self.ix1600 else ():
             rows = self.page_rows(w)
             stride = self.width_px * CHANNELS[self.mode]
             if rows and rows * stride < len(buf[w]):
@@ -332,7 +349,7 @@ class UsbScanner:
         hopper empty too, and the panel sat on "Scanning..." for ~25s and then
         flashed an ADF error. Any other ending keeps 31 02 + 05, as before.
         """
-        if self.last_fault == 0x03:
+        if self.ix1600 and self.last_fault == 0x03:
             steps = (self.mode_2c(0x05), self.mode_2c(0x07))
         else:
             steps = (("31 02", [0x31, 0x02, 0, 0, 0, 0, 0, 0, 0, 0], None), self.mode_2c(0x05))
@@ -347,8 +364,9 @@ class UsbScanner:
         # ScanSnap Home tells the panel a batch is starting (06, then 04) as
         # soon as the press is seen. Without it the panel stayed on
         # "Scanning..." for ~20s after the last sheet.
-        for _, cdb, payload in (self.mode_2c(0x06), self.mode_2c(0x04)):
-            self._cmd(cdb, 0, payload)
+        if self.ix1600:
+            for _, cdb, payload in (self.mode_2c(0x06), self.mode_2c(0x04)):
+                self._cmd(cdb, 0, payload)
         self.setup()
         pages = 0
         try:

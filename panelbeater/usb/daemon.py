@@ -34,7 +34,7 @@ from pathlib import Path
 from .. import output
 from ..config import Config
 from .panel import Panel
-from .scanner import UsbScanner
+from .scanner import UsbScanner, is_ix1600
 from .transport import Ix1500, ScannerAbsent, ScannerBusy
 
 SCAN_SW_MASK = 0x01
@@ -204,6 +204,7 @@ def serve(cfg: Config, log=print) -> int:
     lost = 0
     next_rearm = time.monotonic() + rearm if rearm else None
     next_keepalive = time.monotonic() + KEEPALIVE_S
+    keepalive = is_ix1600(dev)
     try:
         while True:
             try:
@@ -258,7 +259,7 @@ def serve(cfg: Config, log=print) -> int:
                 arm(dev, user_id, log=log)
                 next_rearm = time.monotonic() + rearm
                 next_keepalive = time.monotonic() + KEEPALIVE_S
-            elif time.monotonic() >= next_keepalive:
+            elif keepalive and time.monotonic() >= next_keepalive:
                 try:
                     open_session(dev, user_id)
                 except Exception as exc:  # noqa: BLE001 -- the poll handles a lost device
@@ -279,6 +280,7 @@ def scan_once(cfg: Config, dev: Ix1500, log=print) -> None:
     as the paper has gone through.
     """
     work = Path(tempfile.mkdtemp(prefix="panelbeater-"))
+    failed = False
     try:
         scanner = UsbScanner(
             dev,
@@ -291,10 +293,12 @@ def scan_once(cfg: Config, dev: Ix1500, log=print) -> None:
     except Exception as exc:  # noqa: BLE001
         log(f"[{stamp()}] scan failed: {exc}")
         sides = 0
-        # Return the panel to the profile screen after a failure -- a crashed
-        # scan is exactly when it would otherwise stick on "Scanning...". Not
-        # after a good batch: scan_batch has already ended it, and a second
-        # 31 02 after the last sheet fails and holds the panel on "Scanning...".
+        failed = True
+    # Return the panel to the profile screen after a failure -- a crashed scan
+    # is exactly when it would otherwise stick on "Scanning...". On an iX1600
+    # not after a good batch: scan_batch has already ended it, and a second
+    # 31 02 after the last sheet fails and holds the panel on "Scanning...".
+    if failed or not is_ix1600(dev):
         finish_batch(dev, log=log)
 
     pages = sorted(str(p) for p in work.glob("page-*.jpg")) if sides else []
